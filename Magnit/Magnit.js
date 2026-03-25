@@ -10,7 +10,7 @@
   );
 
   // ──────────────────────────────────────────────────────────────
-  // 1. ВВОД ДАННЫХ ОТ ПОЛЬЗОВАТЕЛЯ (через запятую)
+  // 1. ВВОД ДАННЫХ ОТ ПОЛЬЗОВАТЕЛЯ
   // ──────────────────────────────────────────────────────────────
 
   const storesInput = prompt(
@@ -54,8 +54,12 @@
   const LIMIT_PER_REQUEST = 32;
   const MIN_DELAY_MS = 1200;
   const MAX_DELAY_MS = 3500;
-  const DELAY_BETWEEN_COMBOS = 3000; // между разными парами магазин+категория
+  const DELAY_BETWEEN_COMBOS = 3000;
+  const MAX_RETRIES = 2; // сколько раз пробовать при ошибке
   const today = new Date().toISOString().slice(0, 10);
+
+  // Массив для сбора ошибок
+  let errors = [];
 
   // ──────────────────────────────────────────────────────────────
   // 3. Headers (общие для всех запросов)
@@ -80,10 +84,10 @@
   );
 
   // ──────────────────────────────────────────────────────────────
-  // 4. Функция одного запроса
+  // 4. Функция одного запроса с повторными попытками
   // ──────────────────────────────────────────────────────────────
 
-  async function fetchPage(storeCode, categoryId, offset) {
+  async function fetchPage(storeCode, categoryId, offset, attempt = 0) {
     const body = {
       sort: { order: "desc", type: "popularity" },
       pagination: { limit: LIMIT_PER_REQUEST, offset },
@@ -103,22 +107,28 @@
       });
 
       if (!resp.ok) {
+        if (resp.status === 503 && attempt < MAX_RETRIES) {
+          throw new Error(`HTTP 503 - сервис недоступен`);
+        }
         throw new Error(`HTTP ${resp.status}`);
       }
 
       return await resp.json();
     } catch (err) {
-      console.warn(
-        `%c⚠️ Ошибка запроса [${storeCode}/${categoryId}] offset=${offset}: ${err.message}`,
-        "color: #cc6600;",
-      );
-      await new Promise((r) => setTimeout(r, 5000));
-      return fetchPage(storeCode, categoryId, offset); // ретрай
+      if (attempt < MAX_RETRIES) {
+        console.warn(
+          `%c⚠️ Ошибка запроса [${storeCode}/${categoryId}] offset=${offset} (попытка ${attempt + 1}): ${err.message}`,
+          "color: #cc6600;",
+        );
+        await new Promise((r) => setTimeout(r, 7000)); // пауза перед повтором
+        return fetchPage(storeCode, categoryId, offset, attempt + 1);
+      }
+      throw err; // если попытки кончились — пробрасываем ошибку
     }
   }
 
   // ──────────────────────────────────────────────────────────────
-  // 5. Главная функция сбора для одной пары магазин+категория
+  // 5. Главная функция сбора для одной пары
   // ──────────────────────────────────────────────────────────────
 
   async function collectFor(storeCode, categoryId) {
@@ -131,46 +141,78 @@
     let offset = 0;
     let totalCount = null;
     let page = 1;
+    let attempt = 0;
 
-    while (true) {
-      console.log(`%c  Запрос #${page} | offset ${offset}`, "color: #888;");
+    while (attempt <= MAX_RETRIES) {
+      try {
+        while (true) {
+          console.log(
+            `%c  Запрос #${page} | offset ${offset} (попытка ${attempt + 1})`,
+            "color: #888;",
+          );
 
-      const data = await fetchPage(storeCode, categoryId, offset);
+          const data = await fetchPage(storeCode, categoryId, offset, attempt);
 
-      if (!data?.items || !data?.pagination) {
-        console.error(
-          "%c  Нет items или pagination — прерываю категорию",
-          "color: #cc0000;",
+          if (!data?.items || !data?.pagination) {
+            console.error(
+              "%c  Нет items или pagination — прерываю категорию",
+              "color: #cc0000;",
+            );
+            break;
+          }
+
+          const count = data.items.length;
+          console.log(`%c  Получено ${count} товаров`, "color: #006600;");
+
+          allProducts.push(...data.items);
+
+          totalCount = data.pagination.totalCount ?? totalCount;
+
+          if (!data.pagination.hasMore || count < LIMIT_PER_REQUEST) {
+            console.log(
+              `%c  Конец категории (hasMore=false или получено меньше ${LIMIT_PER_REQUEST})`,
+              "color: #006600;",
+            );
+            break;
+          }
+
+          offset += LIMIT_PER_REQUEST;
+          page++;
+
+          const delay = Math.floor(
+            MIN_DELAY_MS + Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS + 1),
+          );
+          console.log(
+            `%c  Пауза ${Math.round(delay / 100) / 10} сек...`,
+            "color: #777; font-style: italic;",
+          );
+          await new Promise((r) => setTimeout(r, delay));
+        }
+
+        break; // успешно завершили цикл
+      } catch (err) {
+        attempt++;
+        console.warn(
+          `%c⚠️ Критическая ошибка [${storeCode}/${categoryId}] (попытка ${attempt}/${MAX_RETRIES + 1}): ${err.message}`,
+          "color: #cc6600;",
         );
-        break;
+
+        if (attempt > MAX_RETRIES) {
+          console.error(
+            `%c❌ Не удалось собрать после ${MAX_RETRIES + 1} попыток`,
+            "color: #cc0000; font-weight: bold;",
+          );
+          errors.push({
+            storeCode,
+            categoryId,
+            error: err.message,
+            success: false,
+          });
+          break;
+        }
+
+        await new Promise((r) => setTimeout(r, 10000)); // 10 сек перед следующей попыткой всего комбо
       }
-
-      const count = data.items.length;
-      console.log(`%c  Получено ${count} товаров`, "color: #006600;");
-
-      allProducts.push(...data.items);
-
-      totalCount = data.pagination.totalCount ?? totalCount;
-
-      if (!data.pagination.hasMore || count < LIMIT_PER_REQUEST) {
-        console.log(
-          `%c  Конец категории (hasMore=false или получено меньше ${LIMIT_PER_REQUEST})`,
-          "color: #006600;",
-        );
-        break;
-      }
-
-      offset += LIMIT_PER_REQUEST;
-      page++;
-
-      const delay = Math.floor(
-        MIN_DELAY_MS + Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS + 1),
-      );
-      console.log(
-        `%c  Пауза ${Math.round(delay / 100) / 10} сек...`,
-        "color: #777; font-style: italic;",
-      );
-      await new Promise((r) => setTimeout(r, delay));
     }
 
     // ───── Сохранение ─────
@@ -201,7 +243,16 @@
           "color: #444;",
         );
       }
-    } else {
+
+      if (attempt > 0) {
+        errors.push({
+          storeCode,
+          categoryId,
+          error: `Успешно со ${attempt + 1} попытки`,
+          success: true,
+        });
+      }
+    } else if (attempt > MAX_RETRIES) {
       console.warn(
         `%c⚠️ Ничего не собрано для ${storeCode}/${categoryId}`,
         "color: #cc6600;",
@@ -217,7 +268,6 @@
     for (const cat of categoryIds) {
       await collectFor(store, cat);
 
-      // Пауза между разными парами
       if (storeCodes.length * categoryIds.length > 1) {
         console.log(
           `%c  Пауза между комбинациями ~${DELAY_BETWEEN_COMBOS / 1000} сек...`,
@@ -229,13 +279,53 @@
   }
 
   // ──────────────────────────────────────────────────────────────
-  // Финальный отчёт
+  // 7. Финальный отчёт + сохранение ошибок
   // ──────────────────────────────────────────────────────────────
 
   console.log(
     "\n%c━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     "color: #0066cc;",
   );
+
+  if (errors.length > 0) {
+    console.log(
+      "%c⚠️ Были ошибки во время сбора:",
+      "color: #cc6600; font-weight: bold;",
+    );
+
+    let report = `Отчёт по ошибкам Магнита - ${today}\n\n`;
+
+    errors.forEach((e, i) => {
+      const status = e.success
+        ? "✅ Успешно со второй попытки"
+        : "❌ Не удалось";
+      console.log(
+        `%c${status} | ${e.storeCode} / ${e.categoryId} → ${e.error}`,
+        e.success ? "color: #006600;" : "color: #cc0000;",
+      );
+
+      report += `${i + 1}. ${e.storeCode} / ${e.categoryId} — ${status} — ${e.error}\n`;
+    });
+
+    const reportBlob = new Blob([report], { type: "text/plain" });
+    const reportUrl = URL.createObjectURL(reportBlob);
+    const a = document.createElement("a");
+    a.href = reportUrl;
+    a.download = `magnit_errors_report_${today}.txt`;
+    a.click();
+    URL.revokeObjectURL(reportUrl);
+
+    console.log(
+      "%c💾 Отчёт об ошибках сохранён: magnit_errors_report_" + today + ".txt",
+      "color: #cc6600; font-weight: bold;",
+    );
+  } else {
+    console.log(
+      "%c✅ Все категории собраны без ошибок!",
+      "color: #006600; font-weight: bold;",
+    );
+  }
+
   console.log(
     "%cВСЁ ГОТОВО!",
     "color: #006600; font-weight: bold; font-size: 1.2em;",
@@ -244,6 +334,5 @@
     `%cСобрано комбинаций: ${storeCodes.length} × ${categoryIds.length}`,
     "color: #444;",
   );
-  console.log("%cКаждый набор сохранён в отдельный файл.", "color: #444;");
   console.log("%cМожешь продолжать собирать данные дальше.", "color: #444;");
 })();
